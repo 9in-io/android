@@ -1,0 +1,18 @@
+# Gradle and Android
+.gradle/
+build/
+local.properties
+*.iml
+.idea/
+.kotlin/
+captures/
+.externalNativeBuild/
+.cxx/
+*.apk
+*.aab
+
+# macOS
+.DS_Store
+
+# Live e2e settings never belong here
+.env*

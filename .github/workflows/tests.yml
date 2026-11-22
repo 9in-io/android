@@ -1,0 +1,106 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Unit and Robolectric tests (JDK 21)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # Robolectric needs JDK 21 to run Android 17 (API 37).
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - uses: gradle/actions/setup-gradle@v6
+
+      - name: Tests (API 24, 30 and 37 under Robolectric)
+        run: ./gradlew :nine:testDebugUnitTest --stacktrace
+
+      - name: Lint
+        run: ./gradlew :nine:lintRelease
+
+      - name: Example app
+        run: ./gradlew :examples:app:assembleDebug
+
+      - uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: test-reports
+          path: nine/build/reports/
+
+  jitpack:
+    name: JitPack build (JDK 17)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v6
+
+      - name: Publish to the local Maven repository, as JitPack does
+        run: ./gradlew :nine:publishReleasePublicationToMavenLocal
+
+      - name: Check the published artifact
+        run: |
+          dir=~/.m2/repository/com/github/9in-io/android/0.1.0
+          ls -l "$dir"
+          test -f "$dir/android-0.1.0.aar"
+          test -f "$dir/android-0.1.0.pom"
+          test -f "$dir/android-0.1.0-sources.jar"
+          grep -q '<artifactId>kotlinx-coroutines-android</artifactId>' "$dir/android-0.1.0.pom"
+          unzip -p "$dir/android-0.1.0.aar" AndroidManifest.xml | grep -q 'android:scheme="${nineRedirectScheme}"'
+
+  device:
+    name: Device tests (API ${{ matrix.api }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The oldest supported Android version and a current one: Keystore storage, the platform's
+        # signature providers, a whole sign-in with the tokens in the Keystore.
+        api: [23, 36]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - uses: gradle/actions/setup-gradle@v6
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Build the test APKs
+        run: ./gradlew :nine:assembleDebugAndroidTest
+
+      - uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: ${{ matrix.api }}
+          arch: x86_64
+          target: google_apis
+          disable-animations: true
+          script: ./gradlew :nine:connectedDebugAndroidTest
