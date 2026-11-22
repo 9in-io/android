@@ -76,8 +76,14 @@ class DeviceTest {
 
     @Test
     fun aBrowserCanShowTheSignInPage() {
+        // Emulator images without any browser can't run this; the library's <queries> must make
+        // every installed browser visible to it (Android 11+ package visibility).
+        val view = android.content.Intent(android.content.Intent.ACTION_VIEW, android.net.Uri.parse("https://acme.9in.io/"))
+            .addCategory(android.content.Intent.CATEGORY_BROWSABLE)
+        val browsers = context.packageManager.queryIntentActivities(view, android.content.pm.PackageManager.MATCH_ALL)
+        org.junit.Assume.assumeTrue("no browser installed on this device", browsers.isNotEmpty())
         val intent = CustomTabsBrowser.browserIntent(context, "https://acme.9in.io/oauth/authorize?client_id=x")
-        assertNotNull("no browser on this device", intent)
+        assertNotNull("a browser is installed but the SDK didn't find it", intent)
     }
 
     @Test
