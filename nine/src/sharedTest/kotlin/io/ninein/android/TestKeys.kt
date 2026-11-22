@@ -16,7 +16,7 @@ internal class TestKey(val alg: String, val kid: String = "k_${alg.lowercase()}_
         alg.startsWith("RS") || alg.startsWith("PS") -> KeyPairGenerator.getInstance("RSA").apply { initialize(rsaBits) }.generateKeyPair()
         alg == "ES256" -> KeyPairGenerator.getInstance("EC").apply { initialize(ECGenParameterSpec("secp256r1")) }.generateKeyPair()
         alg == "ES384" -> KeyPairGenerator.getInstance("EC").apply { initialize(ECGenParameterSpec("secp384r1")) }.generateKeyPair()
-        alg == "EdDSA" -> KeyPairGenerator.getInstance("Ed25519").generateKeyPair()
+        alg == "EdDSA" -> softwareEd25519().generateKeyPair()
         else -> error("no key for $alg")
     }
 
@@ -103,6 +103,17 @@ internal class TestKey(val alg: String, val kid: String = "k_${alg.lowercase()}_
     }
 
     companion object {
+        /**
+         * An Ed25519 key generator outside the Android Keystore (on Android 16 the default one is
+         * the Keystore's, which needs a key spec). Throws when the platform has none.
+         */
+        fun softwareEd25519(): KeyPairGenerator {
+            val provider = java.security.Security.getProviders().firstOrNull {
+                it.name != "AndroidKeyStore" && it.getService("KeyPairGenerator", "Ed25519") != null
+            } ?: throw java.security.NoSuchAlgorithmException("no software Ed25519 key generator")
+            return KeyPairGenerator.getInstance("Ed25519", provider)
+        }
+
         val ALGORITHMS = listOf("RS256", "RS384", "RS512", "PS256", "PS384", "PS512", "ES256", "ES384", "EdDSA")
 
         fun b64(value: BigInteger, size: Int = 0): String {
