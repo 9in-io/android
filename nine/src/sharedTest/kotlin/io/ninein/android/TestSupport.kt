@@ -5,8 +5,11 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.fail
 
 /** A clock tests can move. */
-internal class TestClock(var now: Long = System.currentTimeMillis()) : Clock {
-    override fun nowMillis(): Long = now
+internal class TestClock(@Volatile var now: Long = System.currentTimeMillis()) : java.time.Clock() {
+    override fun millis(): Long = now
+    override fun instant(): java.time.Instant = java.time.Instant.ofEpochMilli(now)
+    override fun getZone(): java.time.ZoneId = java.time.ZoneOffset.UTC
+    override fun withZone(zone: java.time.ZoneId?): java.time.Clock = this
     fun advance(seconds: Long) {
         now += seconds * 1000
     }
@@ -16,7 +19,7 @@ internal const val REDIRECT = "com.acme.app:/callback"
 
 internal fun FakeNine.client(
     store: CredentialStore = MemoryCredentialStore(),
-    clock: Clock = Clock.SYSTEM,
+    clock: java.time.Clock = java.time.Clock.systemUTC(),
     scopes: List<String> = NineConfig.DEFAULT_SCOPES,
     audience: String? = null,
     locale: String? = null,

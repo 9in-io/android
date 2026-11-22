@@ -11,6 +11,8 @@ dependencyResolutionManagement {
     repositories {
         google()
         mavenCentral()
+        // The 9in Java SDK (com.github.9in-io:java), the protocol core this library is built on.
+        maven("https://jitpack.io") { content { includeGroup("com.github.9in-io") } }
     }
 }
 

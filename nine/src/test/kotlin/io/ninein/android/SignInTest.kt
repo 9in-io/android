@@ -32,20 +32,20 @@ class SignInTest {
         assertTrue(nine.isSignedIn)
         assertEquals(user, nine.user)
 
-        val exchange = fake.requests.single { it.url == fake.tokenEndpoint }
+        val exchange = fake.requests.single { it.url() == fake.tokenEndpoint }
         val form = FakeNine.form(exchange)
         assertEquals("authorization_code", form["grant_type"])
         assertEquals(REDIRECT, form["redirect_uri"])
         assertEquals("app_test", form["client_id"])
         assertTrue(Regex("^[A-Za-z0-9_-]{64}$").matches(form["code_verifier"]!!))
-        assertNull("public clients never send a secret", exchange.headers["Authorization"])
+        assertNull("public clients never send a secret", exchange.header("Authorization"))
 
         val credentials = nine.credentials()!!
         assertNotNull(credentials.refreshToken)
         assertNotNull(credentials.idToken)
         assertEquals(listOf("openid", "profile", "email", "offline_access"), credentials.scopes)
         // Tokens and the finished sign-in are stored; nothing is left pending.
-        assertEquals(setOf("9in:${fake.issuer}:app_test:credentials"), store.keys())
+        assertEquals(setOf("9in:${fake.issuer}:app_test:credentials", "9in:${fake.issuer}:app_test:obtained_at"), store.keys())
     }
 
     @Test
@@ -127,7 +127,7 @@ class SignInTest {
     fun `errors from 9in are reported with their code, after the state check`() = runBlocking<Unit> {
         val denied = expectNine("access_denied") {
             fake.client().signIn(BrowserStep { url, _ ->
-                val state = OidcClient.queryParams(url)["state"]
+                val state = queryParams(url)["state"]
                 "$REDIRECT?error=access_denied&error_description=The+user+declined&state=$state&iss=${fake.issuer}"
             })
         }
@@ -136,7 +136,7 @@ class SignInTest {
             fake.client().signIn(BrowserStep { _, _ -> "$REDIRECT?error=access_denied&state=other&iss=${fake.issuer}" })
         }
         expectNine(NineException.MISSING_CODE) {
-            fake.client().signIn(BrowserStep { url, _ -> "$REDIRECT?state=${OidcClient.queryParams(url)["state"]}&iss=${fake.issuer}" })
+            fake.client().signIn(BrowserStep { url, _ -> "$REDIRECT?state=${queryParams(url)["state"]}&iss=${fake.issuer}" })
         }
     }
 
@@ -156,29 +156,47 @@ class SignInTest {
         }
     }
 
-    private fun idTokenRejected(message: String, setup: () -> Unit) = runBlocking<Unit> {
+    /** The Java core verifies ID tokens (tested there); here: a refused one fails the sign-in and stores nothing. */
+    private fun idTokenRejected(case: String, setup: () -> Unit) = runBlocking<Unit> {
         val f = FakeNine().also { fake = it }
         setup()
         val nine = f.client()
         val e = expectNine(NineException.INVALID_ID_TOKEN) { nine.signIn(f.browser()) }
-        assertEquals(message, e.description)
-        assertEquals("a refused sign-in stores nothing", null, nine.credentials())
+        assertTrue("$case: ${e.description}", e.description.isNotEmpty())
+        assertTrue("$case: the core's error is the cause", e is io.ninein.NineException)
+        assertEquals("$case: a refused sign-in stores nothing", null, nine.credentials())
         assertEquals(AuthState.SignedOut, nine.state.value)
     }
 
     @Test
-    fun `ID token claims are checked`() {
-        idTokenRejected("nonce mismatch") { fake.idTokenClaims = { it["nonce"] = "other" } }
-        idTokenRejected("nonce mismatch") { fake.idTokenClaims = { it.remove("nonce") } }
-        idTokenRejected("audience mismatch") { fake.idTokenClaims = { it["aud"] = "app_other"; it["azp"] = null } }
-        idTokenRejected("authorized party mismatch") { fake.idTokenClaims = { it["aud"] = listOf("app_test", "app_other"); it["azp"] = null } }
-        idTokenRejected("authorized party mismatch") { fake.idTokenClaims = { it["azp"] = "app_other" } }
-        idTokenRejected("issuer mismatch") { fake.idTokenClaims = { it["iss"] = "https://evil.example" } }
-        idTokenRejected("ID token expired") { fake.idTokenClaims = { it["exp"] = System.currentTimeMillis() / 1000 - 400 } }
-        idTokenRejected("ID token not yet valid") { fake.idTokenClaims = { it["nbf"] = System.currentTimeMillis() / 1000 + 400 } }
-        idTokenRejected("no expiry") { fake.idTokenClaims = { it.remove("exp") } }
-        idTokenRejected("missing subject") { fake.idTokenClaims = { it["sub"] = "" } }
-        idTokenRejected("not an ID token") { fake.idTokenHeader = mapOf("typ" to "at+jwt") }
+    fun `ID tokens that fail the core's checks fail the sign-in`() {
+        idTokenRejected("nonce") { fake.idTokenClaims = { it["nonce"] = "other" } }
+        idTokenRejected("audience") { fake.idTokenClaims = { it["aud"] = "app_other"; it["azp"] = null } }
+        idTokenRejected("azp") { fake.idTokenClaims = { it["azp"] = "app_other" } }
+        idTokenRejected("issuer") { fake.idTokenClaims = { it["iss"] = "https://evil.example" } }
+        idTokenRejected("expired") { fake.idTokenClaims = { it["exp"] = System.currentTimeMillis() / 1000 - 400 } }
+        idTokenRejected("typ") { fake.idTokenHeader = mapOf("typ" to "at+jwt") }
+        idTokenRejected("signature") { fake.idTokenOverride = { tamper(fake.idToken(null)) } }
+        idTokenRejected("forged under a known kid") {
+            val forger = TestKey("RS256", kid = fake.key.kid)
+            fake.idTokenOverride = { fake.idToken(null, signer = forger) }
+        }
+        idTokenRejected("alg none") {
+            fake.idTokenOverride = { TestKey.unsigned(mapOf("alg" to "none", "kid" to fake.key.kid), mapOf("iss" to fake.issuer, "sub" to "x", "aud" to "app_test")) }
+        }
+        idTokenRejected("alg not the key's") { fake.idTokenHeader = mapOf("alg" to "RS512") }
+        idTokenRejected("unknown kid") { fake.idTokenHeader = mapOf("kid" to "k_unknown") }
+        idTokenRejected("missing ID token") { fake.tokenResponse = { it.remove("id_token") } }
+    }
+
+    @Test
+    fun `the device clock tolerance reaches the core`() = runBlocking<Unit> {
+        // 9in's ID tokens checked with NineConfig.clockSkewSeconds (300 s by default, for phones
+        // whose clock is a little off), not the core's server default of 30 s.
+        fake.idTokenClaims = { it["exp"] = System.currentTimeMillis() / 1000 - 100; it["iat"] = System.currentTimeMillis() / 1000 + 100 }
+        assertEquals("usr_alice", fake.client().signIn(fake.browser()).id)
+        val strict = NineClient(NineConfig(fake.issuer, fake.clientId, REDIRECT, clockSkewSeconds = 10), MemoryCredentialStore(), fake, kotlinx.coroutines.Dispatchers.IO, java.time.Clock.systemUTC())
+        expectNine(NineException.INVALID_ID_TOKEN) { strict.signIn(fake.browser()) }
     }
 
     @Test
@@ -188,62 +206,12 @@ class SignInTest {
     }
 
     @Test
-    fun `a device clock a little off is tolerated`() = runBlocking<Unit> {
-        fake.idTokenClaims = { it["exp"] = System.currentTimeMillis() / 1000 - 100; it["nbf"] = System.currentTimeMillis() / 1000 + 100 }
-        assertEquals("usr_alice", fake.client().signIn(fake.browser()).id)
-    }
-
-    @Test
-    fun `ID token signatures are checked against the JWKS`() {
-        idTokenRejected("bad signature") {
-            fake.idTokenOverride = { tamper(fake.idToken(null)) }
-        }
-        idTokenRejected("unsupported algorithm none") {
-            fake.idTokenOverride = { TestKey.unsigned(mapOf("alg" to "none", "kid" to fake.key.kid), mapOf("iss" to fake.issuer, "sub" to "x", "aud" to "app_test")) }
-        }
-        idTokenRejected("HS256 ID tokens can't be verified by an app; give the tenant an asymmetric default key") {
-            fake.idTokenOverride = { TestKey.unsigned(mapOf("alg" to "HS256", "kid" to fake.key.kid), mapOf("iss" to fake.issuer), "c2ln") }
-        }
-        idTokenRejected("algorithm does not match the key") { fake.idTokenHeader = mapOf("alg" to "RS512") }
-        idTokenRejected("unknown signing key") { fake.idTokenHeader = mapOf("kid" to "k_unknown") }
-        idTokenRejected("malformed ID token") { fake.idTokenOverride = { "not.a.jwt" } }
-        idTokenRejected("no ID token in the token response") { fake.tokenResponse = { it.remove("id_token") } }
-    }
-
-    @Test
-    fun `a forged token under a known kid fails the signature check`() = runBlocking<Unit> {
-        // The forger reuses the published kid but signs with its own key.
-        val forger = TestKey("RS256", kid = fake.key.kid)
-        fake.idTokenOverride = { fake.idToken(null, signer = forger) }
-        val e = expectNine(NineException.INVALID_ID_TOKEN) { fake.client().signIn(fake.browser()) }
-        assertEquals("bad signature", e.description)
-    }
-
-    @Test
-    fun `a new signing key is found by refetching the JWKS once`() = runBlocking<Unit> {
-        val clock = TestClock()
-        val nine = fake.client(clock = clock)
+    fun `a new signing key is found after a rotation`() = runBlocking<Unit> {
+        val nine = fake.client()
         nine.signIn(fake.browser())
-        assertEquals(1, fake.jwksCalls.get())
-        nine.signIn(fake.browser())
-        assertEquals("cached", 1, fake.jwksCalls.get())
-        fake.key = TestKey("ES256") // rotation: a new default key with a new kid
-        nine.signIn(fake.browser())
+        fake.key = TestKey("ES256") // a new default key with a new kid
+        assertEquals("usr_alice", nine.signIn(fake.browser()).id)
         assertEquals(2, fake.jwksCalls.get())
-        // Unknown kids are looked up once, then not again for a minute.
-        fake.idTokenHeader = mapOf("kid" to "k_junk")
-        expectNine(NineException.INVALID_ID_TOKEN) { nine.signIn(fake.browser()) }
-        assertEquals(3, fake.jwksCalls.get())
-        expectNine(NineException.INVALID_ID_TOKEN) { nine.signIn(fake.browser()) }
-        assertEquals("throttled", 3, fake.jwksCalls.get())
-        clock.advance(61)
-        expectNine(NineException.INVALID_ID_TOKEN) { nine.signIn(fake.browser()) }
-        assertEquals(4, fake.jwksCalls.get())
-        // The JWKS cache expires after 10 minutes.
-        fake.idTokenHeader = emptyMap()
-        clock.advance(11 * 60)
-        nine.signIn(fake.browser())
-        assertEquals(5, fake.jwksCalls.get())
     }
 
     @Test

@@ -57,21 +57,21 @@ class DeviceTest {
     }
 
     @Test
-    fun everyAlgorithmVerifiesWithThePlatformProviders() {
-        val data = "header.payload".toByteArray()
-        for (alg in TestKey.ALGORITHMS - "EdDSA") {
-            val key = TestKey(alg)
-            val sig = key.sign(data)
-            assertTrue("$alg on API ${Build.VERSION.SDK_INT}", Jws.verify(alg, key.jwk(), data, sig))
-            assertFalse("$alg tampered", Jws.verify(alg, key.jwk(), "header.payloaD".toByteArray(), sig))
+    fun everyAlgorithmSignsInThroughTheCoreOnThisDevice() = runBlocking<Unit> {
+        // The Java core verifies the ID token's signature with this device's providers (PSS in
+        // its own code, EC with the platform's curves).
+        for (alg in TestKey.ALGORITHMS) {
+            val key = try {
+                TestKey(alg)
+            } catch (e: java.security.GeneralSecurityException) {
+                continue // this Android version can't make Ed25519 keys for the test
+            }
+            AuthorizationBroker.reset()
+            val fake = FakeNine(key = key)
+            val nine = NineClient(NineConfig(fake.issuer, fake.clientId, "io.ninein.android.test:/callback"), MemoryCredentialStore(), fake)
+            assertEquals("$alg on API ${Build.VERSION.SDK_INT}", "usr_alice", nine.signIn(fake.browser()).id)
+            assertEquals("$alg refresh on API ${Build.VERSION.SDK_INT}", "usr_alice", nine.refresh().tokenSet.subject())
         }
-        // EdDSA with the SDK's own verifier (RFC 8032 test 2), which older Android versions need.
-        fun hex(s: String) = ByteArray(s.length / 2) { s.substring(it * 2, it * 2 + 2).toInt(16).toByte() }
-        val pub = hex("3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c")
-        val sig = hex("92a009a9f0d4cab8720e820b5f642540a2b27b5416503f8fb3762223ebdb69da085ac1e43e15996e458f3613d0f11d8c387b2eaeb4302aeeb00d291612bb0c00")
-        val jwk = mapOf("kty" to "OKP", "crv" to "Ed25519", "x" to Base64Url.encode(pub))
-        assertTrue(Jws.verify("EdDSA", jwk, hex("72"), sig))
-        assertFalse(Jws.verify("EdDSA", jwk, hex("73"), sig))
     }
 
     @Test

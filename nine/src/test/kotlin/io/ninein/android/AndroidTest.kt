@@ -40,7 +40,7 @@ private const val TEST_SCHEME = "io.ninein.android.test"
 private const val TEST_REDIRECT = "$TEST_SCHEME:/callback"
 
 @RunWith(RobolectricTestRunner::class)
-@Config(sdk = [24, 30, 37])
+@Config(sdk = [26, 30, 37])
 class KeystoreCredentialStoreTest {
     private val context: Context = ApplicationProvider.getApplicationContext()
     private val key: SecretKey = KeyGenerator.getInstance("AES").apply { init(256) }.generateKey()
@@ -142,7 +142,7 @@ class KeystoreCredentialStoreTest {
 }
 
 @RunWith(RobolectricTestRunner::class)
-@Config(sdk = [24, 30, 37])
+@Config(sdk = [26, 30, 37])
 class BrowserFlowTest {
     private val context: Context = ApplicationProvider.getApplicationContext()
 
@@ -319,7 +319,7 @@ class BrowserFlowTest {
     fun `sign-in and sign-out through Custom Tabs, end to end`() = runBlocking<Unit> {
         installBrowser(customTabs = true)
         val fake = FakeNine()
-        val nine = NineClient(NineConfig(fake.issuer, fake.clientId, TEST_REDIRECT), MemoryCredentialStore(), fake, Dispatchers.IO, Clock.SYSTEM)
+        val nine = NineClient(NineConfig(fake.issuer, fake.clientId, TEST_REDIRECT), MemoryCredentialStore(), fake, Dispatchers.IO, java.time.Clock.systemUTC())
         val host = Robolectric.buildActivity(Activity::class.java).setup().get()
 
         val signIn = runOffMain { nine.signIn(host) }
@@ -351,7 +351,7 @@ class BrowserFlowTest {
     fun `closing the Custom Tab cancels the sign-in`() = runBlocking<Unit> {
         installBrowser(customTabs = true)
         val fake = FakeNine()
-        val nine = NineClient(NineConfig(fake.issuer, fake.clientId, TEST_REDIRECT), MemoryCredentialStore(), fake, Dispatchers.IO, Clock.SYSTEM)
+        val nine = NineClient(NineConfig(fake.issuer, fake.clientId, TEST_REDIRECT), MemoryCredentialStore(), fake, Dispatchers.IO, java.time.Clock.systemUTC())
         val host = Robolectric.buildActivity(Activity::class.java).setup().get()
         val signIn = runOffMain { nine.signIn(host) }
         var started: Intent? = null
@@ -365,7 +365,7 @@ class BrowserFlowTest {
     fun `a redirect after the process restarted completes the sign-in`() = runBlocking<Unit> {
         val fake = FakeNine()
         val store = MemoryCredentialStore()
-        val before = NineClient(NineConfig(fake.issuer, fake.clientId, TEST_REDIRECT), store, fake, Dispatchers.IO, Clock.SYSTEM)
+        val before = NineClient(NineConfig(fake.issuer, fake.clientId, TEST_REDIRECT), store, fake, Dispatchers.IO, java.time.Clock.systemUTC())
         val url = CompletableDeferred<String>()
         val job = runOffMain {
             before.signIn(BrowserStep { u, _ ->
@@ -376,7 +376,7 @@ class BrowserFlowTest {
         val redirect = fake.authorize(url.await())
         job.cancel()
         AuthorizationBroker.reset() // the process is gone
-        val after = NineClient(NineConfig(fake.issuer, fake.clientId, TEST_REDIRECT), store, fake, Dispatchers.IO, Clock.SYSTEM)
+        val after = NineClient(NineConfig(fake.issuer, fake.clientId, TEST_REDIRECT), store, fake, Dispatchers.IO, java.time.Clock.systemUTC())
         after.state.first { it != AuthState.Loading }
         // The task was gone too: the redirect starts a fresh NineAuthActivity with no request.
         val auth = Robolectric.buildActivity(NineAuthActivity::class.java, NineAuthActivity.redirectIntent(context, Uri.parse(redirect))).setup()

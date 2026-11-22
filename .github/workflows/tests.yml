@@ -28,14 +28,14 @@ jobs:
 
       - uses: gradle/actions/setup-gradle@v6
 
-      - name: Tests (API 24, 30 and 37 under Robolectric)
+      - name: Tests (API 26, 30 and 37 under Robolectric)
         run: ./gradlew :nine:testDebugUnitTest --stacktrace
 
       - name: Lint
         run: ./gradlew :nine:lintRelease
 
-      - name: Example app
-        run: ./gradlew :examples:app:assembleDebug
+      - name: Example app (debug, and release shrunk with R8)
+        run: ./gradlew :examples:app:assembleDebug :examples:app:assembleRelease
 
       - uses: actions/upload-artifact@v7
         if: failure()
@@ -67,6 +67,8 @@ jobs:
           test -f "$dir/android-0.1.0.pom"
           test -f "$dir/android-0.1.0-sources.jar"
           grep -q '<artifactId>kotlinx-coroutines-android</artifactId>' "$dir/android-0.1.0.pom"
+          grep -q '<groupId>com.github.9in-io</groupId>' "$dir/android-0.1.0.pom"
+          grep -q '<artifactId>java</artifactId>' "$dir/android-0.1.0.pom"
           unzip -p "$dir/android-0.1.0.aar" AndroidManifest.xml | grep -q 'android:scheme="${nineRedirectScheme}"'
 
   device:
@@ -77,7 +79,7 @@ jobs:
       matrix:
         # The oldest supported Android version and a current one: Keystore storage, the platform's
         # signature providers, a whole sign-in with the tokens in the Keystore.
-        api: [23, 36]
+        api: [26, 36]
     steps:
       - uses: actions/checkout@v7
 

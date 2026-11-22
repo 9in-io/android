@@ -14,6 +14,10 @@ import org.junit.Assert.assertTrue
 import org.junit.Assume.assumeTrue
 import org.junit.Before
 import org.junit.Test
+import io.ninein.http.HttpRequest
+import io.ninein.http.HttpResponse
+import io.ninein.http.HttpTransport
+import io.ninein.http.UrlConnectionTransport
 import java.io.File
 import java.net.HttpURLConnection
 import java.net.URI
@@ -55,12 +59,12 @@ class LiveTest {
             val token = clientCredentials(env("SANDBOX_ISSUER"), "management:users:read management:users:write")
             for (email in emails) {
                 val found = http("GET", "${env("SANDBOX_ISSUER")}/api/v1/users/lookup?email=${java.net.URLEncoder.encode(email, "UTF-8")}", headers = mapOf("Authorization" to "Bearer $token"))
-                if (found.status == 404) continue
-                assertEquals("lookup $email", 200, found.status)
+                if (found.status() == 404) continue
+                assertEquals("lookup $email", 200, found.status())
                 @Suppress("UNCHECKED_CAST")
-                val id = (Json.parseObject(found.text)["user"] as Map<String, Any?>)["id"] as String
+                val id = (Json.parseObject(found.bodyText())["user"] as Map<String, Any?>)["id"] as String
                 val deleted = http("DELETE", "${env("SANDBOX_ISSUER")}/api/v1/users/$id", headers = mapOf("Authorization" to "Bearer $token"))
-                assertTrue("delete $email: HTTP ${deleted.status}", deleted.status == 204 || deleted.status == 200 || deleted.status == 404)
+                assertTrue("delete $email: HTTP ${deleted.status()}", deleted.status() == 204 || deleted.status() == 200 || deleted.status() == 404)
             }
         }
 
@@ -71,27 +75,23 @@ class LiveTest {
 
         private fun clientCredentials(issuer: String, scope: String): String {
             val res = http("POST", "$issuer/oauth/token", mapOf("grant_type" to "client_credentials", "scope" to scope), mapOf("Authorization" to basic()))
-            assertEquals("client credentials", 200, res.status)
-            return Json.parseObject(res.text).string("access_token")!!
+            assertEquals("client credentials", 200, res.status())
+            return Json.parseObject(res.bodyText()).string("access_token")!!
         }
 
         /** Introspects a token with the confidential client (null when its secret isn't configured). */
         private fun introspect(token: String): Boolean? {
             if (settings["SERVER_CLIENT_SECRET"].isNullOrEmpty()) return null
             val res = http("POST", "${env("SANDBOX_ISSUER")}/oauth/introspect", mapOf("token" to token), mapOf("Authorization" to basic()))
-            assertEquals(200, res.status)
-            return Json.parseObject(res.text)["active"] == true
+            assertEquals(200, res.status())
+            return Json.parseObject(res.bodyText())["active"] == true
         }
 
-        private fun http(method: String, url: String, form: Map<String, String>? = null, headers: Map<String, String> = emptyMap()): HttpResponse =
-            UrlConnectionTransport().execute(
-                HttpRequest(
-                    method,
-                    url,
-                    headers + (if (form != null) mapOf("Content-Type" to "application/x-www-form-urlencoded") else emptyMap()) + mapOf("Accept" to "application/json"),
-                    form?.let { formEncode(it).toByteArray() },
-                ),
-            )
+        private fun http(method: String, url: String, form: Map<String, String>? = null, headers: Map<String, String> = emptyMap()): HttpResponse {
+            val request = HttpRequest.builder().method(method).url(url).headers(headers).header("Accept", "application/json")
+            if (form != null) request.header("Content-Type", "application/x-www-form-urlencoded").body(formEncode(form))
+            return UrlConnectionTransport().send(request.build())
+        }
     }
 
     private val issuer get() = env("SANDBOX_ISSUER")
@@ -192,23 +192,23 @@ class LiveTest {
 
     private val tokenRequests = AtomicInteger()
     private val counting = HttpTransport { request ->
-        if (request.url.endsWith("/oauth/token") && FakeNine.form(request)["grant_type"] == "refresh_token") tokenRequests.incrementAndGet()
-        UrlConnectionTransport().execute(request)
+        if (request.url().endsWith("/oauth/token") && FakeNine.form(request)["grant_type"] == "refresh_token") tokenRequests.incrementAndGet()
+        UrlConnectionTransport().send(request)
     }
 
-    private fun client(clock: Clock = Clock.SYSTEM, audience: String? = null, scopes: List<String> = NineConfig.DEFAULT_SCOPES) =
+    private fun client(clock: java.time.Clock = java.time.Clock.systemUTC(), audience: String? = null, scopes: List<String> = NineConfig.DEFAULT_SCOPES) =
         NineClient(NineConfig(issuer, clientId, redirect, scopes, audience), MemoryCredentialStore(), counting, Dispatchers.IO, clock)
 
     @Test
     fun `discovery advertises what the SDK relies on`() = runBlocking<Unit> {
-        val discovery = client().oidc.discovery()
-        assertEquals(issuer, discovery.issuer)
-        assertTrue(discovery.authorizationResponseIssParameterSupported)
-        assertEquals("$issuer/oauth/token", discovery.tokenEndpoint)
-        assertNotNull(discovery.revocationEndpoint)
-        assertNotNull(discovery.endSessionEndpoint)
+        val discovery = client().auth.discovery()
+        assertEquals(issuer, discovery.issuer())
+        assertTrue(discovery.authorizationResponseIssParameterSupported())
+        assertEquals("$issuer/oauth/token", discovery.tokenEndpoint())
+        assertNotNull(discovery.revocationEndpoint())
+        assertNotNull(discovery.endSessionEndpoint())
         @Suppress("UNCHECKED_CAST")
-        assertTrue((discovery.raw["code_challenge_methods_supported"] as List<String>).contains("S256"))
+        assertTrue((discovery.raw()["code_challenge_methods_supported"] as List<String>).contains("S256"))
     }
 
     @Test
@@ -220,14 +220,15 @@ class LiveTest {
         assertTrue(user.id.isNotEmpty())
         assertEquals(issuer, user["iss"])
         val callback = seen.last()
-        assertEquals(issuer, OidcClient.queryParams(callback)["iss"])
-        assertEquals(OidcClient.queryParams(seen.first())["state"], OidcClient.queryParams(callback)["state"])
+        assertEquals(issuer, queryParams(callback)["iss"])
+        assertEquals(queryParams(seen.first())["state"], queryParams(callback)["state"])
         val credentials = nine.credentials()!!
         assertNotNull(credentials.refreshToken)
         assertTrue(credentials.scopes.containsAll(listOf("openid", "offline_access")))
         // The ID token's signature was checked against the tenant's JWKS (its kid and algorithm).
-        val header = Jwt.decode(credentials.idToken!!).header
-        assertTrue(Jws.isSupported(header["alg"] as String))
+        val header = jwtPart(credentials.idToken!!, 0)
+        assertTrue(header["alg"] in TestKey.ALGORITHMS)
+        assertEquals(user.claims, credentials.tokenSet.claims())
         val info = nine.userInfo()
         assertEquals(user.id, info["sub"])
         assertEquals(email, info["email"])
@@ -239,12 +240,13 @@ class LiveTest {
         val nine = client(audience = audience, scopes = NineConfig.DEFAULT_SCOPES + "read:things")
         nine.signIn(step(HostedBrowser(), email))
         val token = nine.accessToken()
-        val jwt = Jwt.decode(token)
-        assertEquals("at+jwt", (jwt.header["typ"] as String).lowercase())
-        val aud = jwt.payload["aud"]
+        val header = jwtPart(token, 0)
+        val payload = jwtPart(token, 1)
+        assertEquals("at+jwt", (header["typ"] as String).lowercase())
+        val aud = payload["aud"]
         assertTrue(aud == audience || (aud is List<*> && audience in aud))
-        assertEquals(clientId, jwt.payload["client_id"])
-        assertTrue((jwt.payload["scope"] as String).split(" ").contains("read:things"))
+        assertEquals(clientId, payload["client_id"])
+        assertTrue((payload["scope"] as String).split(" ").contains("read:things"))
         introspect(token)?.let { assertTrue("introspection says the token is live", it) }
     }
 
@@ -261,11 +263,11 @@ class LiveTest {
         val after = nine.credentials()!!
         assertNotEquals(before.accessToken, after.accessToken)
         assertNotEquals("the refresh token rotated", before.refreshToken, after.refreshToken)
-        assertEquals(before.idToken?.let { Jwt.decode(it).payload["sub"] }, nine.user!!.id)
+        assertEquals(before.idToken?.let { jwtPart(it, 1)["sub"] }, nine.user!!.id)
         // Within 30 s, the old refresh token is a race, not reuse: 9in answers with the newest one.
         val repeat = http("POST", "$issuer/oauth/token", mapOf("grant_type" to "refresh_token", "refresh_token" to before.refreshToken!!, "client_id" to clientId))
-        assertEquals(200, repeat.status)
-        assertEquals(after.refreshToken, Json.parseObject(repeat.text).string("refresh_token"))
+        assertEquals(200, repeat.status())
+        assertEquals(after.refreshToken, Json.parseObject(repeat.bodyText()).string("refresh_token"))
         // And the SDK keeps working with the newest one.
         assertNotNull(nine.refresh().refreshToken)
     }
@@ -295,17 +297,17 @@ class LiveTest {
         }, postLogoutRedirectUri = returnTo)
         assertFalse(nine.isSignedIn)
         assertNull(nine.credentials())
-        val p = OidcClient.queryParams(logoutUrl!!)
+        val p = queryParams(logoutUrl!!)
         assertTrue(logoutUrl!!.startsWith("$issuer/oauth/logout?"))
         assertEquals(credentials.idToken, p["id_token_hint"])
         // The refresh token is revoked…
         val refused = http("POST", "$issuer/oauth/token", mapOf("grant_type" to "refresh_token", "refresh_token" to credentials.refreshToken!!, "client_id" to clientId))
-        assertEquals(400, refused.status)
-        assertEquals("invalid_grant", Json.parseObject(refused.text).string("error"))
+        assertEquals(400, refused.status())
+        assertEquals("invalid_grant", Json.parseObject(refused.bodyText()).string("error"))
         expectNine(NineException.LOGIN_REQUIRED) { nine.accessToken() }
         // …and the 9in session is over: the next sign-in shows the sign-in page again.
         val third = client()
-        val shown = third.oidc.authorizationRequest(SignInOptions(), signUp = false).url
+        val shown = third.auth.createLogin().url()
         val (callback, page) = browser.follow(shown, redirect)
         assertNull(callback)
         assertTrue(page!!.html.contains("name=\"identifier\""))
@@ -319,7 +321,7 @@ class LiveTest {
         var page: HostedBrowser.Page? = null
         expectNine(NineException.CANCELED) {
             nine.signUp(BrowserStep { url, redirectUri ->
-                assertEquals("create", OidcClient.queryParams(url)["prompt"])
+                assertEquals("create", queryParams(url)["prompt"])
                 page = HostedBrowser().follow(url, redirectUri).second
                 throw NineException(NineException.CANCELED)
             }, SignInOptions(loginHint = "new@sandbox.e2e.test", locale = "de"))

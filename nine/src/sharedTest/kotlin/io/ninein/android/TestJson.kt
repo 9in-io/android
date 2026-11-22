@@ -7,6 +7,7 @@ package io.ninein.android
  * Values are `Map<String, Any?>` (insertion-ordered), `List<Any?>`, `String`, `Long` (integers that
  * fit), `Double` (other numbers), `Boolean` and `null`.
  */
+/** A small JSON reader and writer for the tests (the SDK itself uses the Java core's). */
 internal object Json {
     private const val MAX_DEPTH = 64
 
@@ -19,15 +20,15 @@ internal object Json {
         return value
     }
 
-    /** Parses a JSON object, or throws [NineException] ([NineException.INVALID_RESPONSE]). */
+    /** Parses a JSON object. */
     fun parseObject(text: String): Map<String, Any?> {
         val value = try {
             parse(text)
         } catch (e: IllegalArgumentException) {
-            throw NineException(NineException.INVALID_RESPONSE, "malformed JSON", cause = e)
+            throw IllegalArgumentException("malformed JSON", e)
         }
         @Suppress("UNCHECKED_CAST")
-        return value as? Map<String, Any?> ?: throw NineException(NineException.INVALID_RESPONSE, "expected a JSON object")
+        return value as? Map<String, Any?> ?: throw IllegalArgumentException("expected a JSON object")
     }
 
     fun stringify(value: Any?): String = StringBuilder().also { write(it, value) }.toString()
@@ -257,3 +258,38 @@ internal fun Map<String, Any?>.long(key: String): Long? = when (val v = this[key
     is Double -> if (v.isFinite() && v == Math.rint(v)) v.toLong() else null
     else -> null
 }
+
+// Small helpers the tests share (the SDK's own copies live in the Java core).
+
+internal object Base64Url {
+    fun encode(bytes: ByteArray): String = java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(bytes)
+    fun decode(text: String): ByteArray = java.util.Base64.getUrlDecoder().decode(text)
+}
+
+internal object Crypto {
+    private val random = java.security.SecureRandom()
+    fun randomString(bytes: Int): String = Base64Url.encode(ByteArray(bytes).also { random.nextBytes(it) })
+}
+
+internal fun formEncode(form: Map<String, String>): String =
+    form.entries.joinToString("&") { (k, v) -> "${java.net.URLEncoder.encode(k, "UTF-8")}=${java.net.URLEncoder.encode(v, "UTF-8")}" }
+
+internal fun withQuery(url: String, params: Map<String, String>): String =
+    if (params.isEmpty()) url else url + (if (url.contains('?')) "&" else "?") + formEncode(params)
+
+/** Query parameters of a URL (decoded; the first value wins). */
+internal fun queryParams(url: String): Map<String, String> {
+    val params = LinkedHashMap<String, String>()
+    for (pair in url.substringBefore('#').substringAfter('?', "").split('&')) {
+        if (pair.isEmpty()) continue
+        val eq = pair.indexOf('=')
+        val name = java.net.URLDecoder.decode(if (eq >= 0) pair.substring(0, eq) else pair, "UTF-8")
+        if (name !in params) params[name] = if (eq >= 0) java.net.URLDecoder.decode(pair.substring(eq + 1), "UTF-8") else ""
+    }
+    return params
+}
+
+/** The payload of a JWT, unverified (for assertions). */
+@Suppress("UNCHECKED_CAST")
+internal fun jwtPart(token: String, part: Int): Map<String, Any?> =
+    Json.parse(String(Base64Url.decode(token.split('.')[part]), Charsets.UTF_8)) as Map<String, Any?>

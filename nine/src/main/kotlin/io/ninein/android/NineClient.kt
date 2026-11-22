@@ -1,6 +1,11 @@
 package io.ninein.android
 
 import android.content.Context
+import io.ninein.AuthClient
+import io.ninein.PendingLogin
+import io.ninein.TokenSet
+import io.ninein.http.HttpTransport
+import io.ninein.http.UrlConnectionTransport
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
@@ -14,10 +19,14 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import java.time.Clock
+import java.time.Duration
 
 /**
  * Sign-in for Android apps with 9in: authorization code flow with PKCE in Custom Tabs, tokens
- * encrypted with an Android Keystore key, refresh with rotation, sign-out.
+ * encrypted with an Android Keystore key, refresh with rotation, sign-out. The protocol (discovery,
+ * PKCE, the redirect and ID token checks, token requests) is the Java SDK's [AuthClient]; this class
+ * adds the browser, storage, coroutines and state.
  *
  * ```
  * val nine = NineClient(context, issuer = "https://acme.9in.io", clientId = "app_…", redirectUri = "com.acme.app:/callback")
@@ -40,7 +49,7 @@ public class NineClient internal constructor(
     /** A client that keeps its tokens in [store] (any platform; see [MemoryCredentialStore]). */
     @JvmOverloads
     public constructor(config: NineConfig, store: CredentialStore, http: HttpTransport = UrlConnectionTransport()) :
-        this(config, store, http, Dispatchers.IO, Clock.SYSTEM)
+        this(config, store, http, Dispatchers.IO, Clock.systemUTC())
 
     /** A client that keeps its tokens encrypted with an Android Keystore key ([KeystoreCredentialStore]). */
     @JvmOverloads
@@ -64,11 +73,13 @@ public class NineClient internal constructor(
         scopes: List<String> = NineConfig.DEFAULT_SCOPES,
     ) : this(context, NineConfig(issuer, clientId, redirectUri, scopes, audience))
 
-    internal val oidc = OidcClient(config, http, io, clock)
+    /** The Java SDK client that speaks the protocol (blocking calls: always on [io]). */
+    internal val auth: AuthClient = config.authClient(userAgent(http), clock)
     private val scope = CoroutineScope(SupervisorJob() + io)
     private val keyPrefix = "9in:${config.issuer}:${config.clientId}"
     private val credentialsKey = "$keyPrefix:credentials"
     private val pendingKey = "$keyPrefix:pending"
+    private val obtainedKey = "$keyPrefix:obtained_at"
 
     private val lock = Any()
     private val loaded = CompletableDeferred<Unit>()
@@ -95,13 +106,18 @@ public class NineClient internal constructor(
 
     private fun load() {
         try {
-            val stored = store.read(credentialsKey)?.let { Credentials.fromJson(it) }
-            pending = store.read(pendingKey)?.let { PendingLogin.fromJson(it) }
-            if (stored != null && (stored.refreshToken != null || !stored.isExpired(0, clock.nowMillis()))) {
+            val stored = store.read(credentialsKey)?.let { readTokens(it) }?.let {
+                Credentials(it, store.read(obtainedKey)?.toLongOrNull() ?: 0)
+            }
+            pending = store.read(pendingKey)?.let { readPending(it) }
+            if (stored != null && (stored.refreshToken != null || !stored.isExpired(0, clock.millis()))) {
                 credentials = stored
-                mutableState.value = AuthState.SignedIn(userFrom(stored.idToken))
+                mutableState.value = AuthState.SignedIn(NineUser(stored.tokenSet.claims()))
             } else {
-                if (stored != null) store.write(credentialsKey, null)
+                if (stored != null) {
+                    store.write(credentialsKey, null)
+                    store.write(obtainedKey, null)
+                }
                 mutableState.value = AuthState.SignedOut
             }
         } catch (e: Exception) {
@@ -147,12 +163,13 @@ public class NineClient internal constructor(
 
     private suspend fun authorize(browser: BrowserStep, options: SignInOptions, signUp: Boolean): NineUser {
         awaitLoaded()
-        val request = oidc.authorizationRequest(options, signUp)
-        withContext(io) { savePending(request.pending) }
+        val login = withContext(io) {
+            core { auth.createLogin(options.toLoginOptions(config, signUp)) }.also { savePending(it.pending()) }
+        }
         val callback = try {
-            browser.open(request.url, config.redirectUri)
+            browser.open(login.url(), config.redirectUri)
         } catch (e: NineException) {
-            if (e.code == NineException.CANCELED) withContext(io) { clearPending(request.pending.state) }
+            if (e.code == NineException.CANCELED) withContext(io) { clearPending(login.pending().state()) }
             throw e
         }
         // Once 9in has redirected back, finish even if the caller goes away (a rotation, say):
@@ -170,15 +187,18 @@ public class NineClient internal constructor(
         awaitLoaded()
         return withContext(io) {
             signInLock.withLock {
-                val state = OidcClient.queryParams(url)["state"]
                 val current = pending
-                val matches = current != null && state != null && Crypto.safeEquals(current.state, state)
+                // The redirect must belong to the sign-in in progress before anything in it counts,
+                // even an error: another app can send this activity any URL with our scheme.
+                if (current == null) throw NineException(NineException.INVALID_STATE, "no sign-in in progress")
+                if (!matchesState(url, current)) throw NineException(NineException.INVALID_STATE, "state mismatch")
                 // Single use: a redirect for this sign-in consumes it, whatever the outcome.
-                if (matches) clearPending(current!!.state)
-                val result = oidc.exchangeCode(url, if (matches) current else null)
-                val user = NineUser(result.claims ?: emptyMap())
+                clearPending(current.state())
+                val tokens = core { auth.handleCallback(url, current) }
+                val obtained = clock.millis()
+                val user = NineUser(tokens.claims())
                 // After any refresh of the previous session, so its result can't overwrite this one.
-                refreshLock.withLock { saveCredentials(result.credentials, user) }
+                refreshLock.withLock { saveCredentials(Credentials(tokens, obtained), user) }
                 user
             }
         }
@@ -189,9 +209,8 @@ public class NineClient internal constructor(
      * (the caller was cancelled, or the process was restarted while the browser was open).
      */
     internal fun offerRedirect(url: String): Boolean {
-        val state = OidcClient.queryParams(url)["state"] ?: return false
         val current = pending ?: return false
-        if (!Crypto.safeEquals(current.state, state)) return false
+        if (!matchesState(url, current)) return false
         scope.launch {
             try {
                 handleRedirect(url)
@@ -216,13 +235,13 @@ public class NineClient internal constructor(
     @JvmOverloads
     public suspend fun accessToken(minValiditySeconds: Long = 60): String {
         awaitLoaded()
-        credentials?.let { if (!it.isExpired(it.margin(minValiditySeconds), clock.nowMillis())) return it.accessToken }
+        credentials?.let { if (!it.isExpired(it.margin(minValiditySeconds), clock.millis())) return it.accessToken }
         return refreshLock.withLock {
             val current = credentials ?: throw NineException(NineException.LOGIN_REQUIRED, "nobody is signed in")
-            if (!current.isExpired(current.margin(minValiditySeconds), clock.nowMillis())) return@withLock current.accessToken
+            if (!current.isExpired(current.margin(minValiditySeconds), clock.millis())) return@withLock current.accessToken
             if (current.refreshToken == null) {
                 // Nothing to refresh with: the token is good until it actually expires.
-                if (!current.isExpired(0, clock.nowMillis())) return@withLock current.accessToken
+                if (!current.isExpired(0, clock.millis())) return@withLock current.accessToken
                 withContext(io) { clearSession() }
                 throw NineException(NineException.LOGIN_REQUIRED, "the access token expired and there is no refresh token (request offline_access)")
             }
@@ -248,10 +267,12 @@ public class NineClient internal constructor(
 
     private suspend fun refreshNow(current: Credentials): Credentials {
         try {
-            val result = oidc.refresh(current, user?.id?.takeIf { it.isNotEmpty() })
-            val newUser = result.claims?.let { NineUser(it) } ?: user ?: userFrom(result.credentials.idToken)
-            saveCredentials(result.credentials, newUser)
-            return result.credentials
+            // The core checks a new ID token (same subject) and keeps the old refresh token only
+            // when 9in sends none back.
+            val tokens = core { auth.refresh(current.tokenSet) }
+            val next = Credentials(tokens, clock.millis())
+            saveCredentials(next, NineUser(tokens.claims()))
+            return next
         } catch (e: NineException) {
             when (e.code) {
                 NineException.INVALID_GRANT -> {
@@ -275,7 +296,10 @@ public class NineClient internal constructor(
     }
 
     /** The user's current profile from 9in's userinfo endpoint. */
-    public suspend fun userInfo(): Map<String, Any?> = oidc.userInfo(accessToken())
+    public suspend fun userInfo(): Map<String, Any?> {
+        val token = accessToken()
+        return withContext(io) { core { auth.userInfo(token) } }
+    }
 
     // ---------------------------------------------------------------------------------------------
     // Sign-out
@@ -305,13 +329,13 @@ public class NineClient internal constructor(
         withContext(NonCancellable + io) {
             val token = current?.refreshToken
             try {
-                if (token != null) oidc.revoke(token, "refresh_token") else current?.let { oidc.revoke(it.accessToken, "access_token") }
+                core { if (token != null) auth.revoke(token, "refresh_token") else current?.let { auth.revoke(it.accessToken, "access_token") } }
             } catch (e: NineException) {
                 // Signing out never fails because 9in can't be reached; the tokens are gone here.
             }
         }
         if (browser != null) {
-            val url = oidc.endSessionUrl(current?.idToken, postLogoutRedirectUri, state = null)
+            val url = withContext(io) { core { auth.logoutUrl(current?.idToken, postLogoutRedirectUri, null) } }
             try {
                 browser.open(url, postLogoutRedirectUri ?: config.redirectUri)
             } catch (e: NineException) {
@@ -329,7 +353,7 @@ public class NineClient internal constructor(
     }
 
     private fun clearPending(state: String) = synchronized(lock) {
-        if (pending?.state == state) {
+        if (pending?.state() == state) {
             pending = null
             forget(pendingKey)
         }
@@ -340,13 +364,15 @@ public class NineClient internal constructor(
         // for this run even if the store fails.
         credentials = value
         mutableState.value = AuthState.SignedIn(user)
-        persist(credentialsKey, value.toJson())
+        persist(credentialsKey, value.tokenSet.toJson())
+        persist(obtainedKey, value.obtainedAtMillis.toString())
     }
 
     private fun clearSession() = synchronized(lock) {
         credentials = null
         mutableState.value = AuthState.SignedOut
         forget(credentialsKey)
+        forget(obtainedKey)
     }
 
     private fun persist(key: String, value: String) {
@@ -366,12 +392,60 @@ public class NineClient internal constructor(
         }
     }
 
-    private fun userFrom(idToken: String?): NineUser {
-        if (idToken == null) return NineUser(emptyMap())
-        return try {
-            NineUser(Jwt.decode(idToken).payload)
-        } catch (e: IllegalArgumentException) {
-            NineUser(emptyMap())
+    private fun readTokens(json: String): TokenSet? = try {
+        TokenSet.fromJson(json)
+    } catch (e: io.ninein.NineException) {
+        null
+    }
+
+    private fun readPending(json: String): PendingLogin? = try {
+        PendingLogin.fromJson(json)
+    } catch (e: RuntimeException) {
+        null
+    }
+
+    /** Whether the redirect's `state` is the pending sign-in's (constant time). */
+    private fun matchesState(url: String, login: PendingLogin): Boolean {
+        val state = queryParameter(url, "state")?.toByteArray(Charsets.UTF_8) ?: return false
+        val expected = login.state().toByteArray(Charsets.UTF_8)
+        var diff = state.size xor expected.size
+        for (i in 0 until minOf(state.size, expected.size)) diff = diff or (state[i].toInt() xor expected[i].toInt())
+        return diff == 0
+    }
+
+    internal companion object {
+        /** Adds `User-Agent: 9in-android/<version>` to requests that don't name one. */
+        fun userAgent(inner: HttpTransport): HttpTransport = HttpTransport { request ->
+            if (request.header("User-Agent") != null) {
+                inner.send(request)
+            } else {
+                inner.send(
+                    io.ninein.http.HttpRequest.builder()
+                        .method(request.method())
+                        .url(request.url())
+                        .headers(request.headers())
+                        .header("User-Agent", "9in-android/${Nine.VERSION}")
+                        .body(request.body())
+                        .build(),
+                )
+            }
+        }
+
+        /** A query parameter of a redirect URL, decoded (the first one wins). */
+        fun queryParameter(url: String, name: String): String? {
+            val query = url.substringBefore('#').substringAfter('?', "")
+            for (pair in query.split('&')) {
+                val eq = pair.indexOf('=')
+                val key = if (eq >= 0) pair.substring(0, eq) else pair
+                try {
+                    if (java.net.URLDecoder.decode(key, "UTF-8") == name) {
+                        return if (eq >= 0) java.net.URLDecoder.decode(pair.substring(eq + 1), "UTF-8") else ""
+                    }
+                } catch (e: IllegalArgumentException) {
+                    // A malformed escape: not this parameter.
+                }
+            }
+            return null
         }
     }
 }

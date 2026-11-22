@@ -28,7 +28,7 @@ class NineClientTest {
         fake = FakeNine()
     }
 
-    private fun tokenCalls(grant: String) = fake.requests.count { it.url == fake.tokenEndpoint && FakeNine.form(it)["grant_type"] == grant }
+    private fun tokenCalls(grant: String) = fake.requests.count { it.url() == fake.tokenEndpoint && FakeNine.form(it)["grant_type"] == grant }
 
     @Test
     fun `a fresh access token is returned without calling 9in`() = runBlocking<Unit> {
@@ -56,8 +56,8 @@ class NineClientTest {
         assertFalse(fake.isRefreshTokenValid(old.refreshToken!!))
         assertTrue(fake.isRefreshTokenValid(new.refreshToken!!))
         // The stored copy is the new one, so a restarted app uses the right refresh token.
-        assertEquals(new.refreshToken, Credentials.fromJson(store.read("9in:${fake.issuer}:app_test:credentials")!!)!!.refreshToken)
-        assertEquals("refreshed without the client id? no", "app_test", FakeNine.form(fake.requests.last { it.url == fake.tokenEndpoint })["client_id"])
+        assertEquals(new.refreshToken, io.ninein.TokenSet.fromJson(store.read("9in:${fake.issuer}:app_test:credentials")!!).refreshToken())
+        assertEquals("refreshed without the client id? no", "app_test", FakeNine.form(fake.requests.last { it.url() == fake.tokenEndpoint })["client_id"])
         assertEquals("usr_alice", nine.user!!.id)
         // A custom margin.
         assertEquals(token, nine.accessToken(minValiditySeconds = 0))
@@ -188,7 +188,7 @@ class NineClientTest {
         nine.signIn(fake.browser())
         fake.subject = "usr_mallory"
         val e = expectNine(NineException.INVALID_ID_TOKEN) { nine.refresh() }
-        assertEquals("the ID token is for another user", e.description)
+        assertEquals("the subject changed", e.description)
         assertEquals(AuthState.SignedOut, nine.state.value)
 
         val again = fake.client()
@@ -298,7 +298,7 @@ class NineClientTest {
         nine.signOut(BrowserStep { url, redirect -> opened = url to redirect; "$redirect?state=" }, postLogoutRedirectUri = REDIRECT)
         val (url, redirect) = opened!!
         assertTrue(url.startsWith("${fake.issuer}/oauth/logout?"))
-        val p = OidcClient.queryParams(url)
+        val p = queryParams(url)
         assertEquals("app_test", p["client_id"])
         assertEquals(idToken, p["id_token_hint"])
         assertEquals(REDIRECT, p["post_logout_redirect_uri"])
@@ -308,7 +308,7 @@ class NineClientTest {
         val again = fake.client()
         again.signIn(fake.browser())
         again.signOut(BrowserStep { url2, _ ->
-            assertNull(OidcClient.queryParams(url2)["post_logout_redirect_uri"])
+            assertNull(queryParams(url2)["post_logout_redirect_uri"])
             throw NineException(NineException.CANCELED)
         })
         assertFalse(again.isSignedIn)
@@ -333,7 +333,7 @@ class NineClientTest {
         val info = nine.userInfo()
         assertEquals("usr_alice", info["sub"])
         val call = fake.requests.last()
-        assertEquals("Bearer ${nine.credentials()!!.accessToken}", call.headers["Authorization"])
+        assertEquals("Bearer ${nine.credentials()!!.accessToken}", call.header("Authorization"))
         fake.endSessions()
         assertEquals(401, expectNine(NineException.INVALID_TOKEN) { nine.userInfo() }.status)
     }
@@ -348,14 +348,19 @@ class NineClientTest {
     }
 
     @Test
-    fun `credentials round trip through JSON`() {
-        val c = Credentials("at", "Bearer", 123, "rt", "id", "openid email")
-        val back = Credentials.fromJson(c.toJson())!!
-        assertEquals(listOf("at", "Bearer", 123L, "rt", "id", "openid email"), listOf(back.accessToken, back.tokenType, back.expiresAtMillis, back.refreshToken, back.idToken, back.scope))
-        assertNull(Credentials.fromJson("{}"))
-        assertNull(Credentials.fromJson("[]"))
-        assertTrue(Credentials("a", "Bearer", 1000, null, null, null).isExpired(0, 1000))
-        assertFalse(Credentials("a", "Bearer", 70_000, null, null, null).isExpired(60, 1000))
+    fun `credentials show the core's token set`() {
+        val tokens = io.ninein.TokenSet.builder().accessToken("at").tokenType("Bearer").expiresAt(java.time.Instant.ofEpochMilli(70_000))
+            .refreshToken("rt").idToken("id").scope("openid email").claims(mapOf("sub" to "usr_1")).build()
+        val c = Credentials(tokens, 10_000)
+        assertEquals(listOf("at", "Bearer", 70_000L, "rt", "id", "openid email"), listOf(c.accessToken, c.tokenType, c.expiresAtMillis, c.refreshToken, c.idToken, c.scope))
+        assertEquals(listOf("openid", "email"), c.scopes)
+        assertTrue(c.isExpired(0, 70_000))
+        assertFalse(c.isExpired(60, 1000))
+        assertTrue(c.isExpired(60, 10_001))
+        // Without expires_in, never expired.
+        val unknown = Credentials(io.ninein.TokenSet.builder().accessToken("a").build(), 0)
+        assertEquals(Long.MAX_VALUE, unknown.expiresAtMillis)
+        assertFalse(unknown.isExpired(3600, Long.MAX_VALUE - 1))
     }
 
     @Test
@@ -411,11 +416,12 @@ class NineClientTest {
     @Test
     fun `a custom transport sees every request`() = runBlocking<Unit> {
         val seen = mutableListOf<String>()
-        val transport = HttpTransport { request -> seen.add("${request.method} ${request.url.substringBefore('?')}"); fake.execute(request) }
+        val transport = io.ninein.http.HttpTransport { request -> seen.add("${request.method()} ${request.url().substringBefore('?')}"); fake.send(request) }
         val nine = NineClient(NineConfig(fake.issuer, fake.clientId, REDIRECT), MemoryCredentialStore(), transport)
         nine.signIn(fake.browser())
+        assertTrue(fake.requests.all { it.header("User-Agent") == "9in-android/${Nine.VERSION}" })
         assertEquals(listOf("GET ${fake.issuer}/.well-known/openid-configuration", "POST ${fake.issuer}/oauth/token", "GET ${fake.issuer}/.well-known/jwks.json"), seen)
-        val failing = NineClient(NineConfig(fake.issuer, fake.clientId, REDIRECT), MemoryCredentialStore(), HttpTransport { throw IOException("offline") })
+        val failing = NineClient(NineConfig(fake.issuer, fake.clientId, REDIRECT), MemoryCredentialStore(), io.ninein.http.HttpTransport { throw IOException("offline") })
         expectNine(NineException.NETWORK_ERROR) { failing.signIn(fake.browser()) }
     }
 }

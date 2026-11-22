@@ -6,14 +6,17 @@
 Official Android SDK for [9in](https://9in.io): hosted login, OpenID Connect provider and SSO.
 
 `io.ninein.android` signs users in to your Android app with your 9in tenant. It is written in
-Kotlin, has a coroutine API, and depends only on AndroidX Browser and kotlinx-coroutines.
+Kotlin with a coroutine API, and is built on the [9in Java SDK](https://github.com/9in-io/java)
+(`com.github.9in-io:java`), whose `AuthClient` speaks the protocol; this library adds the browser,
+the redirect, Keystore storage and the state your UI shows. Besides the Java SDK it depends only on
+AndroidX Browser and kotlinx-coroutines.
 
 - **Sign users in with Custom Tabs**: the authorization code flow with PKCE (S256), `state`,
   `nonce` and the RFC 9207 `iss` check, in the user's browser, never an embedded web view. Password
   managers work, and the 9in session is shared with the browser (single sign-on).
 - **Verified ID tokens**: the signature is checked against your tenant's JWKS with every
-  asymmetric algorithm of the 9in key library (RS256/384/512, PS256/384/512, ES256, ES384 and
-  EdDSA), along with the issuer, audience, expiry and nonce.
+  asymmetric algorithm of the 9in key library (RS256/384/512, PS256/384/512, ES256, ES384, and
+  EdDSA where Android has it), along with the issuer, audience, expiry and nonce.
 - **Tokens encrypted at rest** with AES-256-GCM under a key that stays in the Android Keystore,
   stored outside cloud backups.
 - **Fresh access tokens**: `accessToken()` refreshes before expiry with refresh token rotation,
@@ -22,7 +25,7 @@ Kotlin, has a coroutine API, and depends only on AndroidX Browser and kotlinx-co
 - **Sign-out** that revokes the refresh token and ends the 9in session in the browser.
 - **A browser-step interface**, so your tests can run the whole flow without a UI.
 
-Requires Android 6.0 (API 23) or later, Kotlin 2.0 or later, and an app that compiles against
+Requires Android 8.0 (API 26) or later, Kotlin 2.0 or later, and an app that compiles against
 API 34 or later.
 
 ```kotlin
@@ -46,6 +49,7 @@ The full guide is [Mobile and desktop apps](https://9in.io/docs/native-apps/) in
 | Building with | Use |
 |---|---|
 | iOS, macOS (Swift) | [`9in-io/ios`](https://github.com/9in-io/ios) |
+| Java on the server, or Android without the UI parts | [`com.github.9in-io:java`](https://github.com/9in-io/java) |
 | A back end for your app | [`@9in-io/sdk`](https://github.com/9in-io/sdk) (Node.js), [`9in`](https://github.com/9in-io/python-sdk) (Python), [`9in-io/go-sdk`](https://github.com/9in-io/go-sdk) (Go), [`9in/php-sdk`](https://github.com/9in-io/php-sdk) (PHP) |
 | React Native, Flutter | AppAuth-based libraries, see [the guide](https://9in.io/docs/native-apps/) |
 
@@ -113,6 +117,8 @@ nine.signIn(activity, SignInOptions(loginHint = "jane@acme.com", prompt = "login
 
 `signIn` returns once the user is back in your app: the redirect is checked (`state`, `iss`), the
 code is exchanged with the PKCE verifier, and the ID token is verified before anything is stored.
+A redirect whose `state` doesn't belong to the sign-in in progress is refused before anything in
+it counts, since any app can send your redirect scheme a URL.
 `user` holds the ID token's claims: `id` (`sub`), `email`, `name`, `picture`, `authenticationMethods`
 (`amr`), and every other claim through `user["claim"]`.
 
@@ -241,7 +247,8 @@ val user = nine.signIn(BrowserStep { url, redirectUri ->
 })
 ```
 
-An `HttpTransport` replaces the HTTP client (for example to use OkHttp, or to record requests).
+An `io.ninein.http.HttpTransport` (from the Java SDK) replaces the HTTP client, for example to
+use OkHttp or to record requests: `NineClient(config, store, transport)`.
 
 ## Issuers must use https
 
@@ -250,9 +257,20 @@ tokens in clear text. Plain http is accepted for `localhost`, `*.localhost` and 
 for other development hosts pass `NineConfig(…, allowInsecureIssuer = true)`. Endpoints from
 discovery follow the same rule, and the discovery document must be for the issuer you configured.
 
+## ID token signatures
+
+The Java SDK checks the ID token's signature against your tenant's keys with the algorithms
+Android provides: RS256/384/512, PS256/384/512, ES256 and ES384 on every supported version. EdDSA
+(Ed25519) needs a recent Android release; on a version without it, an EdDSA-signed ID token is
+accepted with the claim checks alone (issuer, audience, expiry, nonce). That is allowed for a
+public client, which gets the ID token straight from 9in's token endpoint over TLS (OpenID Connect
+Core 3.1.3.7). Tenants whose default key is RS256 (the default) or any RSA or EC key are verified
+everywhere.
+
 ## Errors
 
-Every failure is a `NineException` with a `code`, a `description`, and for HTTP errors a `status`:
+Every failure is a `NineException` (`io.ninein.android.NineException`, a subclass of the Java
+SDK's `io.ninein.NineException`) with a `code`, a `description`, and for HTTP errors a `status`:
 
 | Code | Meaning |
 |---|---|
@@ -263,7 +281,7 @@ Every failure is a `NineException` with a `code`, a `description`, and for HTTP 
 | `invalid_state`, `invalid_issuer`, `missing_code` | The redirect doesn't belong to the sign-in in progress |
 | `invalid_id_token` | The ID token failed a check |
 | `insecure_issuer`, `invalid_options` | A configuration mistake |
-| `network_error`, `discovery_failed`, `jwks_unavailable`, `invalid_response` | 9in couldn't be reached, or answered unexpectedly |
+| `network_error`, `discovery_failed`, `jwks_unavailable`, `request_failed`, `invalid_json` | 9in couldn't be reached, or answered unexpectedly |
 | `browser_not_found`, `storage_error` | No browser is installed, or the Keystore failed |
 
 ## Development
@@ -274,6 +292,9 @@ Every failure is a `NineException` with a `code`, a `description`, and for HTTP 
 ./gradlew :examples:app:assembleDebug     # the example app (examples/app)
 ./gradlew :nine:lintRelease
 ```
+
+To change the Java core at the same time, build against a checkout of it:
+`./gradlew --include-build ../java-sdk :nine:testDebugUnitTest`.
 
 The live end-to-end tests sign in through 9in's real hosted pages and need the test tenant's
 settings:

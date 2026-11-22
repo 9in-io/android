@@ -12,7 +12,7 @@ android {
 
     defaultConfig {
         applicationId = "io.ninein.example"
-        minSdk = 24 // Compose needs 24; the SDK itself works from 23
+        minSdk = 26
         targetSdk = 37
         versionCode = 1
         versionName = "0.1.0"
@@ -25,6 +25,14 @@ android {
         buildConfigField("String", "NINE_ISSUER", "\"${providers.gradleProperty("nineIssuer").getOrElse("https://acme.9in.io")}\"")
         buildConfigField("String", "NINE_CLIENT_ID", "\"${providers.gradleProperty("nineClientId").getOrElse("app_7f3k2m9q")}\"")
         buildConfigField("String", "NINE_REDIRECT_URI", "\"io.ninein.example:/callback\"")
+    }
+
+    buildTypes {
+        release {
+            // Shrunk like a real app, to check the SDK (and the Java core's rules) under R8.
+            isMinifyEnabled = true
+            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"))
+        }
     }
 
     buildFeatures {

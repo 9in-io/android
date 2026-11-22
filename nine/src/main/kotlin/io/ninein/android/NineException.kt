@@ -4,13 +4,24 @@ package io.ninein.android
  * Every failure of the SDK. [code] is a stable, machine-readable reason: an OAuth error from 9in
  * (`access_denied`, `invalid_grant`, …) or one of the SDK's own codes listed in the companion.
  * [status] is the HTTP status when the error came from an HTTP response.
+ *
+ * It extends the Java SDK's [io.ninein.NineException] (whose `error()` is [code]); everything
+ * `NineClient` throws is this class, so catching either works.
  */
 public class NineException(
-    public val code: String,
-    public val description: String? = null,
-    public val status: Int? = null,
+    code: String,
+    description: String? = null,
+    status: Int? = null,
     cause: Throwable? = null,
-) : Exception(if (description.isNullOrEmpty()) code else "$code: $description", cause) {
+) : io.ninein.NineException(code, description, status, cause) {
+    /** The error code, e.g. `canceled`, `login_required`, `invalid_grant`. */
+    public val code: String get() = error()
+
+    /** What went wrong, in words (never contains tokens); empty when there is nothing to add. */
+    public val description: String get() = description()
+
+    /** The HTTP status, when the error came from an HTTP response. */
+    public val status: Int? get() = status()
 
     public companion object {
         /** Nobody is signed in, or the session ended (the refresh token was revoked or expired): sign in again. */
@@ -49,14 +60,8 @@ public class NineException(
         /** 9in could not be reached (no network, DNS, TLS or timeout). */
         public const val NETWORK_ERROR: String = "network_error"
 
-        /** 9in answered with something that is not the expected JSON. */
-        public const val INVALID_RESPONSE: String = "invalid_response"
-
         /** The discovery document could not be fetched or is incomplete. */
         public const val DISCOVERY_FAILED: String = "discovery_failed"
-
-        /** The signing keys (JWKS) could not be fetched. */
-        public const val JWKS_UNAVAILABLE: String = "jwks_unavailable"
 
         /** The userinfo endpoint answered with an error other than 401. */
         public const val USERINFO_FAILED: String = "userinfo_failed"
@@ -66,5 +71,16 @@ public class NineException(
 
         /** No browser is installed that can show the sign-in page. */
         public const val BROWSER_NOT_FOUND: String = "browser_not_found"
+
+        /** An error from the Java core, as this class (the same code, description and status). */
+        internal fun from(e: io.ninein.NineException): NineException =
+            e as? NineException ?: NineException(e.error(), e.description().ifEmpty { null }, e.status(), e)
     }
+}
+
+/** Runs a call into the Java core, turning its errors into [NineException]. */
+internal inline fun <T> core(block: () -> T): T = try {
+    block()
+} catch (e: io.ninein.NineException) {
+    throw NineException.from(e)
 }

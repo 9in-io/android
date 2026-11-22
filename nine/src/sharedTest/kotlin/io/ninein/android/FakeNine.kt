@@ -1,5 +1,9 @@
 package io.ninein.android
 
+import io.ninein.AuthClient
+import io.ninein.http.HttpRequest
+import io.ninein.http.HttpResponse
+import io.ninein.http.HttpTransport
 import java.io.IOException
 import java.net.URLDecoder
 import java.util.Collections
@@ -61,7 +65,7 @@ internal class FakeNine(
     /** Plays the sign-in page: validates the authorization request and returns the redirect URL. */
     @Synchronized
     fun authorize(url: String, signedInAs: String = subject): String {
-        val params = OidcClient.queryParams(url)
+        val params = queryParams(url)
         authorizeRequests.add(params)
         check(url.startsWith("$issuer/oauth/authorize?")) { "unexpected authorization endpoint: $url" }
         check(params["client_id"] == clientId) { "client_id" }
@@ -83,23 +87,23 @@ internal class FakeNine(
     // ---------------------------------------------------------------------------------------------
     // HTTP
 
-    override fun execute(request: HttpRequest): HttpResponse {
+    override fun send(request: HttpRequest): HttpResponse {
         if (failNetwork) throw IOException("connection refused")
         requests.add(request)
-        val path = request.url.removePrefix(issuer).substringBefore('?')
+        val path = request.url().removePrefix(issuer).substringBefore('?')
         return when {
-            request.method == "GET" && path == "/.well-known/openid-configuration" -> discovery()
-            request.method == "GET" && path == "/.well-known/jwks.json" -> jwks()
-            request.method == "POST" && path == "/oauth/token" -> token(form(request))
-            request.method == "POST" && path == "/oauth/revoke" -> revoke(form(request))
-            request.method == "GET" && path == "/oauth/userinfo" -> userinfo(request)
+            request.method() == "GET" && path == "/.well-known/openid-configuration" -> discovery()
+            request.method() == "GET" && path == "/.well-known/jwks.json" -> jwks()
+            request.method() == "POST" && path == "/oauth/token" -> token(form(request))
+            request.method() == "POST" && path == "/oauth/revoke" -> revoke(form(request))
+            request.method() == "GET" && path == "/oauth/userinfo" -> userinfo(request)
             else -> json(404, mapOf("error" to "not_found"))
         }
     }
 
     private fun discovery(): HttpResponse {
         discoveryCalls.incrementAndGet()
-        if (discoveryStatus != 200) return json(discoveryStatus, mapOf("error" to "server_error"))
+        if (discoveryStatus != 200) return HttpResponse(discoveryStatus, mapOf("content-type" to "text/html"), "<h1>Service unavailable</h1>".toByteArray())
         val doc = linkedMapOf<String, Any?>(
             "issuer" to issuer,
             "authorization_endpoint" to "$issuer/oauth/authorize",
@@ -129,7 +133,7 @@ internal class FakeNine(
                 val code = codes.remove(form["code"]) ?: return json(400, mapOf("error" to "invalid_grant", "error_description" to "invalid or expired code"))
                 if (code.redirectUri != form["redirect_uri"]) return json(400, mapOf("error" to "invalid_grant", "error_description" to "redirect_uri mismatch"))
                 val verifier = form["code_verifier"] ?: return json(400, mapOf("error" to "invalid_grant", "error_description" to "code_verifier required"))
-                if (Pkce.challenge(verifier) != code.challenge) return json(400, mapOf("error" to "invalid_grant", "error_description" to "PKCE verification failed"))
+                if (AuthClient.codeChallenge(verifier) != code.challenge) return json(400, mapOf("error" to "invalid_grant", "error_description" to "PKCE verification failed"))
                 tokens(code.scope, code.nonce, withRefresh = "offline_access" in code.scope.split(" "))
             }
             "refresh_token" -> {
@@ -182,12 +186,12 @@ internal class FakeNine(
             usedRefreshTokens.add(it)
             accessTokens.remove(it)
         }
-        return HttpResponse(200)
+        return HttpResponse(200, emptyMap(), ByteArray(0))
     }
 
     @Synchronized
     private fun userinfo(request: HttpRequest): HttpResponse {
-        val token = request.headers["Authorization"]?.removePrefix("Bearer ")
+        val token = request.header("Authorization")?.removePrefix("Bearer ")
         if (token == null || token !in accessTokens) return json(401, mapOf("error" to "invalid_token"))
         return json(200, mapOf("sub" to subject, "email" to email, "email_verified" to true))
     }
@@ -205,7 +209,7 @@ internal class FakeNine(
 
     companion object {
         fun form(request: HttpRequest): Map<String, String> {
-            val body = request.body?.toString(Charsets.UTF_8) ?: return emptyMap()
+            val body = request.body()?.toString(Charsets.UTF_8) ?: return emptyMap()
             return body.split('&').filter { it.isNotEmpty() }.associate {
                 val (k, v) = it.split('=', limit = 2) + listOf("")
                 URLDecoder.decode(k, "UTF-8") to URLDecoder.decode(v, "UTF-8")
@@ -213,6 +217,6 @@ internal class FakeNine(
         }
 
         fun json(status: Int, body: Any?): HttpResponse =
-            HttpResponse(status, mapOf("content-type" to listOf("application/json")), Json.stringify(body).toByteArray())
+            HttpResponse(status, mapOf("content-type" to "application/json"), Json.stringify(body).toByteArray())
     }
 }

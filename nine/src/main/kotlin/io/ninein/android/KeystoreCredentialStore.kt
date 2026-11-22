@@ -7,6 +7,8 @@ import android.util.AtomicFile
 import java.io.File
 import java.security.GeneralSecurityException
 import java.security.KeyStore
+import java.security.MessageDigest
+import java.util.Base64
 import javax.crypto.BadPaddingException
 import javax.crypto.IllegalBlockSizeException
 import javax.crypto.Cipher
@@ -70,7 +72,10 @@ public class KeystoreCredentialStore internal constructor(
         }
     }
 
-    private fun fileFor(key: String): AtomicFile = AtomicFile(File(directory, Base64Url.encode(Crypto.sha256(key.toByteArray(Charsets.UTF_8)))))
+    private fun fileFor(key: String): AtomicFile {
+        val hash = MessageDigest.getInstance("SHA-256").digest(key.toByteArray(Charsets.UTF_8))
+        return AtomicFile(File(directory, Base64.getUrlEncoder().withoutPadding().encodeToString(hash)))
+    }
 
     private fun secretKey(): SecretKey = key ?: keyProvider.key().also { key = it }
 

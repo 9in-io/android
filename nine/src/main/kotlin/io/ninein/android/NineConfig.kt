@@ -1,7 +1,12 @@
 package io.ninein.android
 
+import io.ninein.AuthClient
+import io.ninein.LoginOptions
+import io.ninein.http.HttpTransport
 import java.net.URI
 import java.net.URISyntaxException
+import java.time.Clock
+import java.time.Duration
 
 /**
  * What [NineClient] needs to know about your application.
@@ -16,7 +21,7 @@ import java.net.URISyntaxException
  * @param audience an API identifier, to get access tokens for that API.
  * @param locale language of the hosted pages (`ui_locales`), e.g. `"de"`.
  * @param allowInsecureIssuer accept a plain-http issuer other than localhost (development only).
- * @param clockSkewSeconds how far the device clock may be off when the ID token's expiry is checked.
+ * @param clockSkewSeconds how far the device clock may be off when the ID token's times are checked.
  */
 public class NineConfig @JvmOverloads constructor(
     issuer: String,
@@ -28,11 +33,12 @@ public class NineConfig @JvmOverloads constructor(
     public val allowInsecureIssuer: Boolean = false,
     public val clockSkewSeconds: Long = 300,
 ) {
+    private val rawIssuer: String = issuer
+
     /** The normalised issuer (validated, without a trailing slash). */
-    public val issuer: String = Issuer.normalize(issuer, allowInsecureIssuer)
+    public val issuer: String
 
     init {
-        if (clientId.isBlank()) throw NineException(NineException.INVALID_OPTIONS, "clientId is required")
         if (redirectUri.isBlank()) throw NineException(NineException.INVALID_OPTIONS, "redirectUri is required")
         val parsed = try {
             URI(redirectUri)
@@ -44,6 +50,23 @@ public class NineConfig @JvmOverloads constructor(
         }
         if (scopes.any { it.isBlank() || it.contains(' ') }) throw NineException(NineException.INVALID_OPTIONS, "scopes must be single words")
         if (clockSkewSeconds < 0) throw NineException(NineException.INVALID_OPTIONS, "clockSkewSeconds must not be negative")
+        // The Java core validates the issuer (https, no query/fragment/credentials) and the client ID.
+        this.issuer = core { authClient(null, null).issuer() }
+    }
+
+    /** The Java SDK's [AuthClient] for this configuration: the protocol under [NineClient]. */
+    internal fun authClient(transport: HttpTransport?, clock: Clock?): AuthClient {
+        val builder = AuthClient.builder()
+            .issuer(rawIssuer)
+            .clientId(clientId)
+            .redirectUri(redirectUri)
+            .scopes(*scopes.toTypedArray())
+            .audience(audience)
+            .allowInsecureIssuer(allowInsecureIssuer)
+            .leeway(Duration.ofSeconds(clockSkewSeconds))
+        if (transport != null) builder.transport(transport)
+        if (clock != null) builder.clock(clock)
+        return builder.build()
     }
 
     public companion object {
@@ -53,55 +76,25 @@ public class NineConfig @JvmOverloads constructor(
     }
 }
 
-/** Issuer URL rules shared by every 9in SDK. */
-internal object Issuer {
-    /**
-     * Validates an issuer and drops a trailing slash. Issuers must use https; plain http is
-     * accepted only for localhost, `*.localhost` and loopback addresses, or with [allowInsecure].
-     * Query strings, fragments and credentials are rejected.
-     */
-    fun normalize(issuer: String, allowInsecure: Boolean = false): String {
-        val uri = try {
-            URI(issuer.trim())
-        } catch (e: URISyntaxException) {
-            throw NineException(NineException.INVALID_ISSUER, "not a URL: $issuer", cause = e)
-        }
-        val scheme = uri.scheme?.lowercase()
-        if (scheme == null || uri.host.isNullOrEmpty() || uri.isOpaque) throw NineException(NineException.INVALID_ISSUER, "not a URL: $issuer")
-        if (uri.rawQuery != null || uri.rawFragment != null || uri.rawUserInfo != null) {
-            throw NineException(NineException.INVALID_ISSUER, "an issuer has no query, fragment or credentials")
-        }
-        val secure = scheme == "https" || (scheme == "http" && (allowInsecure || isLocalHost(uri.host)))
-        if (!secure) {
-            throw NineException(
-                NineException.INSECURE_ISSUER,
-                "issuer must use https (got $scheme://${uri.host}); plain http is only accepted for localhost",
-            )
-        }
-        return issuer.trim().removeSuffix("/")
+/** Options for one sign-in. */
+public class SignInOptions @JvmOverloads constructor(
+    /** `login` (sign in again), `consent`, `select_account` or `none` (fail instead of showing a page). */
+    public val prompt: String? = null,
+    /** Prefills the identifier on the sign-in page. */
+    public val loginHint: String? = null,
+    /** Ask the user to sign in again if their last sign-in is older than this. */
+    public val maxAgeSeconds: Long? = null,
+    /** Language of the hosted pages for this sign-in (`ui_locales`); overrides [NineConfig.locale]. */
+    public val locale: String? = null,
+    /** Extra authorization parameters. They never replace the ones the SDK sets (state, nonce, PKCE, …). */
+    public val extraParams: Map<String, String> = emptyMap(),
+) {
+    internal fun toLoginOptions(config: NineConfig, signUp: Boolean): LoginOptions {
+        val builder = LoginOptions.builder().extra(extraParams)
+        if (signUp) builder.screen("signup") else prompt?.let { builder.prompt(it) }
+        loginHint?.let { builder.loginHint(it) }
+        maxAgeSeconds?.let { builder.extra("max_age", it.toString()) }
+        (locale ?: config.locale)?.let { builder.locale(it) }
+        return builder.build()
     }
-
-    /** Whether an endpoint from discovery may be used with this issuer (same security rule). */
-    fun checkEndpoint(url: String, issuer: String, allowInsecure: Boolean, name: String): String {
-        val uri = try {
-            URI(url)
-        } catch (e: URISyntaxException) {
-            throw NineException(NineException.DISCOVERY_FAILED, "$name is not a URL", cause = e)
-        }
-        val scheme = uri.scheme?.lowercase()
-        val issuerIsHttp = issuer.startsWith("http://", ignoreCase = true)
-        val ok = !uri.host.isNullOrEmpty() && uri.rawFragment == null && uri.rawUserInfo == null &&
-            (scheme == "https" || (scheme == "http" && (allowInsecure || issuerIsHttp) && (allowInsecure || isLocalHost(uri.host))))
-        if (!ok) throw NineException(NineException.DISCOVERY_FAILED, "$name must be an https URL")
-        return url
-    }
-
-    fun isLocalHost(hostname: String): Boolean {
-        val host = hostname.lowercase().removePrefix("[").removeSuffix("]")
-        return host == "localhost" || host.endsWith(".localhost") || host == "::1" ||
-            Regex("^127(\\.\\d{1,3}){3}$").matches(host)
-    }
-
-    /** Issuers compare equal regardless of a trailing slash. */
-    fun same(a: String?, b: String): Boolean = a != null && a.removeSuffix("/") == b.removeSuffix("/")
 }

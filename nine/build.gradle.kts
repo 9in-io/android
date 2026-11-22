@@ -16,7 +16,7 @@ android {
     compileSdk = 37
 
     defaultConfig {
-        minSdk = 23
+        minSdk = 26 // the Java core uses java.time and java.util.Base64
         consumerProguardFiles("consumer-rules.pro")
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         // Apps may compile against any SDK from 34 (what androidx.browser needs), not only 37.
@@ -75,6 +75,7 @@ kotlin {
 }
 
 dependencies {
+    api(libs.nine.java) // io.ninein.AuthClient: the protocol (discovery, PKCE, checks, tokens)
     api(libs.kotlinx.coroutines.android)
     api(libs.androidx.browser) // CustomTabsBrowser takes a CustomTabsIntent.Builder customisation
 

@@ -5,6 +5,7 @@ agp = "9.5.2"
 kotlin = "2.2.10"
 # Library dependencies are the lowest versions the SDK needs, so apps resolve to their own newer ones.
 coroutines = "1.9.0"
+nine-java = "v0.1.0"
 browser = "1.8.0"
 # Tests and the example app.
 junit = "4.13.2"
@@ -16,6 +17,7 @@ compose-bom = "2026.11.01"
 activity-compose = "1.13.0"
 
 [libraries]
+nine-java = { module = "com.github.9in-io:java", version.ref = "nine-java" }
 androidx-browser = { module = "androidx.browser:browser", version.ref = "browser" }
 kotlinx-coroutines-android = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-android", version.ref = "coroutines" }
 kotlinx-coroutines-test = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-test", version.ref = "coroutines" }
